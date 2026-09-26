@@ -69,7 +69,6 @@ function sendMeetReportForDays(days) {
           meetingMap[meetingCode] = {
             organizer: organizer,
             calendarEventId: calendarEventId,
-            lastSeen: new Date(event.id.time),
             totalDurationSec: 0,
             participantCount: 0,
             sumPacketLoss: 0,
@@ -92,15 +91,10 @@ function sendMeetReportForDays(days) {
           m.sumJitter += jitter;
           m.qualityRecords += 1;
         }
-
-        var eventTime = new Date(event.id.time);
-        if (eventTime > m.lastSeen) {
-          m.lastSeen = eventTime;
-        }
       }
     });
 
-    // 3. Format, enrich with Calendar data, and filter (Duration >= 12 mins)
+    // 3. Format, enrich with Calendar metadata, and filter (Duration >= 12 mins)
     var rowsHtml = "";
     var meetingCodes = Object.keys(meetingMap);
     var filteredCount = 0;
@@ -112,7 +106,7 @@ function sendMeetReportForDays(days) {
       if (data.totalDurationSec >= 720) {
         filteredCount++;
 
-        // Fetch Event Title & Description using CalendarApp
+        // Fetch Event details, scheduled timing, and recurrence from Calendar
         var calendarInfo = getCalendarEventDetails(data.calendarEventId, data.organizer);
 
         var formattedDuration = formatSecondsToDuration(data.totalDurationSec);
@@ -123,9 +117,8 @@ function sendMeetReportForDays(days) {
           '<td style="padding: 8px;">' + code + '</td>' +
           '<td style="padding: 8px;">' + calendarInfo.title + '</td>' +
           '<td style="padding: 8px;">' + calendarInfo.description + '</td>' +
-          '<td style="padding: 8px;">' + data.calendarEventId + '</td>' +
-          '<td style="padding: 8px;">' + data.organizer + '</td>' +
-          '<td style="padding: 8px;">' + data.lastSeen.toLocaleDateString() + '</td>' +
+          '<td style="padding: 8px;">' + calendarInfo.scheduledTime + '</td>' +
+          '<td style="padding: 8px;">' + calendarInfo.repeatDays + '</td>' +
           '<td style="padding: 8px;">' + formattedDuration + '</td>' +
           '<td style="padding: 8px;">' + data.participantCount + '</td>' +
           '<td style="padding: 8px;">' + avgLoss + '</td>' +
@@ -135,7 +128,7 @@ function sendMeetReportForDays(days) {
     });
 
     if (filteredCount === 0) {
-      rowsHtml = '<tr><td colspan="10" style="padding: 12px; text-align: center; color: #777;">No meetings found exceeding 12 minutes.</td></tr>';
+      rowsHtml = '<tr><td colspan="9" style="padding: 12px; text-align: center; color: #777;">No meetings found exceeding 12 minutes.</td></tr>';
     }
 
     // 4. Construct Email Body
@@ -148,9 +141,8 @@ function sendMeetReportForDays(days) {
             '<th style="padding: 8px;">Meeting Code</th>' +
             '<th style="padding: 8px;">Event Title</th>' +
             '<th style="padding: 8px;">Event Details</th>' +
-            '<th style="padding: 8px;">Calendar ID</th>' +
-            '<th style="padding: 8px;">Organizer</th>' +
-            '<th style="padding: 8px;">Last Activity</th>' +
+            '<th style="padding: 8px;">Scheduled Time</th>' +
+            '<th style="padding: 8px;">Recurrence</th>' +
             '<th style="padding: 8px;">Total Duration</th>' +
             '<th style="padding: 8px;">Participant Sessions</th>' +
             '<th style="padding: 8px;">Avg Packet Loss</th>' +
@@ -165,7 +157,7 @@ function sendMeetReportForDays(days) {
     var recipient = Session.getActiveUser().getEmail();
     MailApp.sendEmail({
       to: recipient,
-      subject: "Google Meet Detailed Report (>12 min) - Last " + days + " Days",
+      subject: "Google Meet Summary Report (>12 min) - Last " + days + " Days",
       htmlBody: htmlBody
     });
 
@@ -177,11 +169,11 @@ function sendMeetReportForDays(days) {
 }
 
 /**
- * Helper function to look up Title & Details from Google Calendar
+ * Helper function to look up Title, Details, Scheduled Times & Recurrence from Google Calendar
  */
 function getCalendarEventDetails(eventId, organizerEmail) {
   if (!eventId || eventId === "N/A") {
-    return { title: "N/A", description: "N/A" };
+    return { title: "N/A", description: "N/A", scheduledTime: "N/A", repeatDays: "No" };
   }
 
   try {
@@ -189,22 +181,44 @@ function getCalendarEventDetails(eventId, organizerEmail) {
     var event = calendar.getEventById(eventId);
 
     if (event) {
+      // 1. Description
       var rawDesc = event.getDescription() || "No details provided";
-      // Clean HTML tags and limit length for table formatting
       var cleanDesc = rawDesc.replace(/<[^>]*>?/gm, '').substring(0, 100);
       if (rawDesc.length > 100) cleanDesc += "...";
 
+      // 2. Scheduled Start and End Date/Time
+      var startTime = event.getStartTime();
+      var endTime = event.getEndTime();
+      var timeOptions = { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' };
+      var formattedTiming = startTime.toLocaleDateString(undefined, timeOptions) + " - " + endTime.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+
+      // 3. Recurrence / Repeat Days
+      var repeatDays = "No";
+      if (event.isRecurringEvent()) {
+        repeatDays = "Recurring";
+        try {
+          var series = event.getEventSeries();
+          var recurrence = series.getRecurrence();
+          if (recurrence) {
+            repeatDays = "Yes (Series)";
+          }
+        } catch (recErr) {
+          repeatDays = "Yes";
+        }
+      }
+
       return {
         title: event.getTitle() || "Untitled Event",
-        description: cleanDesc
+        description: cleanDesc,
+        scheduledTime: formattedTiming,
+        repeatDays: repeatDays
       };
     }
   } catch (e) {
-    // If the running user doesn't have permissions to read the organizer's calendar
     Logger.log("Could not fetch calendar event ID " + eventId + ": " + e.message);
   }
 
-  return { title: "Not Found / Restricted", description: "N/A" };
+  return { title: "Not Found / Restricted", description: "N/A", scheduledTime: "N/A", repeatDays: "N/A" };
 }
 
 /**
