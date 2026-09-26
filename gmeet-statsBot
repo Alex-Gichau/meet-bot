@@ -27,7 +27,7 @@ function sendMeetReportForDays(days) {
     activities.forEach(function(event) {
       var organizer = event.actor ? event.actor.email : "Unknown";
       var meetingCode = "Unknown";
-      var calendarId = "N/A";
+      var calendarEventId = "N/A";
       var durationSec = 0;
       var packetLoss = 0;
       var jitter = 0;
@@ -40,7 +40,7 @@ function sendMeetReportForDays(days) {
               meetingCode = String(param.value || "").trim();
             }
             if (param.name === 'calendar_event_id') {
-              calendarId = String(param.value || "").trim();
+              calendarEventId = String(param.value || "").trim();
             }
             if (param.name === 'duration_seconds') {
               var parsedVal = parseInt(param.intValue, 10);
@@ -68,7 +68,7 @@ function sendMeetReportForDays(days) {
         if (!meetingMap[meetingCode]) {
           meetingMap[meetingCode] = {
             organizer: organizer,
-            calendarId: calendarId,
+            calendarEventId: calendarEventId,
             lastSeen: new Date(event.id.time),
             totalDurationSec: 0,
             participantCount: 0,
@@ -79,10 +79,9 @@ function sendMeetReportForDays(days) {
         }
 
         var m = meetingMap[meetingCode];
-        
-        // Update calendarId if it was captured in subsequent logs
-        if (m.calendarId === "N/A" && calendarId !== "N/A") {
-          m.calendarId = calendarId;
+
+        if (m.calendarEventId === "N/A" && calendarEventId !== "N/A") {
+          m.calendarEventId = calendarEventId;
         }
 
         m.participantCount += 1;
@@ -101,7 +100,7 @@ function sendMeetReportForDays(days) {
       }
     });
 
-    // 3. Format and filter aggregated meeting data (Filter: Total Duration >= 12 minutes)
+    // 3. Format, enrich with Calendar data, and filter (Duration >= 12 mins)
     var rowsHtml = "";
     var meetingCodes = Object.keys(meetingMap);
     var filteredCount = 0;
@@ -113,13 +112,18 @@ function sendMeetReportForDays(days) {
       if (data.totalDurationSec >= 720) {
         filteredCount++;
 
+        // Fetch Event Title & Description using CalendarApp
+        var calendarInfo = getCalendarEventDetails(data.calendarEventId, data.organizer);
+
         var formattedDuration = formatSecondsToDuration(data.totalDurationSec);
         var avgLoss = data.qualityRecords > 0 ? (data.sumPacketLoss / data.qualityRecords).toFixed(1) + "%" : "-";
         var avgJitter = data.qualityRecords > 0 ? Math.round(data.sumJitter / data.qualityRecords) + " ms" : "-";
 
         rowsHtml += '<tr style="border-bottom: 1px solid #e0e0e0;">' +
           '<td style="padding: 8px;">' + code + '</td>' +
-          '<td style="padding: 8px;">' + data.calendarId + '</td>' +
+          '<td style="padding: 8px;">' + calendarInfo.title + '</td>' +
+          '<td style="padding: 8px;">' + calendarInfo.description + '</td>' +
+          '<td style="padding: 8px;">' + data.calendarEventId + '</td>' +
           '<td style="padding: 8px;">' + data.organizer + '</td>' +
           '<td style="padding: 8px;">' + data.lastSeen.toLocaleDateString() + '</td>' +
           '<td style="padding: 8px;">' + formattedDuration + '</td>' +
@@ -131,18 +135,20 @@ function sendMeetReportForDays(days) {
     });
 
     if (filteredCount === 0) {
-      rowsHtml = '<tr><td colspan="8" style="padding: 12px; text-align: center; color: #777;">No meetings found exceeding 12 minutes.</td></tr>';
+      rowsHtml = '<tr><td colspan="10" style="padding: 12px; text-align: center; color: #777;">No meetings found exceeding 12 minutes.</td></tr>';
     }
 
     // 4. Construct Email Body
     var htmlBody = '<div style="font-family: Arial, sans-serif; color: #333;">' +
-      '<h2>Google Meet Report (' + days + ' Days) - Meetings > 12 mins</h2>' +
+      '<h2>Google Meet Detailed Report (' + days + ' Days) - Meetings > 12 mins</h2>' +
       '<p><strong>Meetings Displayed:</strong> ' + filteredCount + '</p>' +
       '<table style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: left;">' +
         '<thead>' +
           '<tr style="border-bottom: 2px solid #dadce0; color: #5f6368;">' +
             '<th style="padding: 8px;">Meeting Code</th>' +
-            '<th style="padding: 8px;">Calendar Event ID</th>' +
+            '<th style="padding: 8px;">Event Title</th>' +
+            '<th style="padding: 8px;">Event Details</th>' +
+            '<th style="padding: 8px;">Calendar ID</th>' +
             '<th style="padding: 8px;">Organizer</th>' +
             '<th style="padding: 8px;">Last Activity</th>' +
             '<th style="padding: 8px;">Total Duration</th>' +
@@ -159,7 +165,7 @@ function sendMeetReportForDays(days) {
     var recipient = Session.getActiveUser().getEmail();
     MailApp.sendEmail({
       to: recipient,
-      subject: "Google Meet Summary Report (>12 min) - Last " + days + " Days",
+      subject: "Google Meet Detailed Report (>12 min) - Last " + days + " Days",
       htmlBody: htmlBody
     });
 
@@ -168,6 +174,37 @@ function sendMeetReportForDays(days) {
   } catch (err) {
     Logger.log("Error generating " + days + "-day report: " + err.toString());
   }
+}
+
+/**
+ * Helper function to look up Title & Details from Google Calendar
+ */
+function getCalendarEventDetails(eventId, organizerEmail) {
+  if (!eventId || eventId === "N/A") {
+    return { title: "N/A", description: "N/A" };
+  }
+
+  try {
+    var calendar = CalendarApp.getCalendarById(organizerEmail) || CalendarApp.getDefaultCalendar();
+    var event = calendar.getEventById(eventId);
+
+    if (event) {
+      var rawDesc = event.getDescription() || "No details provided";
+      // Clean HTML tags and limit length for table formatting
+      var cleanDesc = rawDesc.replace(/<[^>]*>?/gm, '').substring(0, 100);
+      if (rawDesc.length > 100) cleanDesc += "...";
+
+      return {
+        title: event.getTitle() || "Untitled Event",
+        description: cleanDesc
+      };
+    }
+  } catch (e) {
+    // If the running user doesn't have permissions to read the organizer's calendar
+    Logger.log("Could not fetch calendar event ID " + eventId + ": " + e.message);
+  }
+
+  return { title: "Not Found / Restricted", description: "N/A" };
 }
 
 /**
