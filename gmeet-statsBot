@@ -1,0 +1,201 @@
+/**
+ * Main wrapper function to build and send the report for a target number of days.
+ * @param {number} days - Number of past days to query (e.g., 7 or 30).
+ */
+function sendMeetReportForDays(days) {
+  var now = new Date();
+  var pastDate = new Date(now.getTime() - (days * 24 * 60 * 60 * 1000));
+  var startTime = pastDate.toISOString();
+
+  try {
+    // 1. Fetch Google Meet audit logs from Admin SDK Reports API
+    var response = AdminReports.Activities.list('all', 'meet', {
+      startTime: startTime,
+      maxResults: 1000
+    });
+
+    var activities = response.items;
+
+    if (!activities || activities.length === 0) {
+      Logger.log("No Google Meet activity found in the last " + days + " days.");
+      return;
+    }
+
+    // 2. Aggregate raw event data by unique meeting_code
+    var meetingMap = {};
+
+    activities.forEach(function(event) {
+      var organizer = event.actor ? event.actor.email : "Unknown";
+      var meetingCode = "Unknown";
+      var calendarId = "N/A";
+      var durationSec = 0;
+      var packetLoss = 0;
+      var jitter = 0;
+
+      if (event.events && event.events.length > 0) {
+        var parameters = event.events[0].parameters;
+        if (parameters) {
+          parameters.forEach(function(param) {
+            if (param.name === 'meeting_code') {
+              meetingCode = String(param.value || "").trim();
+            }
+            if (param.name === 'calendar_event_id') {
+              calendarId = String(param.value || "").trim();
+            }
+            if (param.name === 'duration_seconds') {
+              var parsedVal = parseInt(param.intValue, 10);
+              if (!isNaN(parsedVal) && isFinite(parsedVal)) {
+                durationSec = parsedVal;
+              }
+            }
+            if (param.name === 'mean_packet_loss_percentage') {
+              var parsedLoss = parseFloat(param.floatValue);
+              if (!isNaN(parsedLoss) && isFinite(parsedLoss)) {
+                packetLoss = parsedLoss;
+              }
+            }
+            if (param.name === 'mean_jitter_msec') {
+              var parsedJitter = parseInt(param.intValue, 10);
+              if (!isNaN(parsedJitter) && isFinite(parsedJitter)) {
+                jitter = parsedJitter;
+              }
+            }
+          });
+        }
+      }
+
+      if (meetingCode !== "Unknown" && meetingCode !== "") {
+        if (!meetingMap[meetingCode]) {
+          meetingMap[meetingCode] = {
+            organizer: organizer,
+            calendarId: calendarId,
+            lastSeen: new Date(event.id.time),
+            totalDurationSec: 0,
+            participantCount: 0,
+            sumPacketLoss: 0,
+            sumJitter: 0,
+            qualityRecords: 0
+          };
+        }
+
+        var m = meetingMap[meetingCode];
+        
+        // Update calendarId if it was captured in subsequent logs
+        if (m.calendarId === "N/A" && calendarId !== "N/A") {
+          m.calendarId = calendarId;
+        }
+
+        m.participantCount += 1;
+        m.totalDurationSec += durationSec;
+        
+        if (packetLoss > 0 || jitter > 0) {
+          m.sumPacketLoss += packetLoss;
+          m.sumJitter += jitter;
+          m.qualityRecords += 1;
+        }
+
+        var eventTime = new Date(event.id.time);
+        if (eventTime > m.lastSeen) {
+          m.lastSeen = eventTime;
+        }
+      }
+    });
+
+    // 3. Format and filter aggregated meeting data (Filter: Total Duration >= 12 minutes)
+    var rowsHtml = "";
+    var meetingCodes = Object.keys(meetingMap);
+    var filteredCount = 0;
+
+    meetingCodes.forEach(function(code) {
+      var data = meetingMap[code];
+
+      // FILTER: Only process meetings with a total duration >= 12 minutes (720 seconds)
+      if (data.totalDurationSec >= 720) {
+        filteredCount++;
+
+        var formattedDuration = formatSecondsToDuration(data.totalDurationSec);
+        var avgLoss = data.qualityRecords > 0 ? (data.sumPacketLoss / data.qualityRecords).toFixed(1) + "%" : "-";
+        var avgJitter = data.qualityRecords > 0 ? Math.round(data.sumJitter / data.qualityRecords) + " ms" : "-";
+
+        rowsHtml += '<tr style="border-bottom: 1px solid #e0e0e0;">' +
+          '<td style="padding: 8px;">' + code + '</td>' +
+          '<td style="padding: 8px;">' + data.calendarId + '</td>' +
+          '<td style="padding: 8px;">' + data.organizer + '</td>' +
+          '<td style="padding: 8px;">' + data.lastSeen.toLocaleDateString() + '</td>' +
+          '<td style="padding: 8px;">' + formattedDuration + '</td>' +
+          '<td style="padding: 8px;">' + data.participantCount + '</td>' +
+          '<td style="padding: 8px;">' + avgLoss + '</td>' +
+          '<td style="padding: 8px;">' + avgJitter + '</td>' +
+        '</tr>';
+      }
+    });
+
+    if (filteredCount === 0) {
+      rowsHtml = '<tr><td colspan="8" style="padding: 12px; text-align: center; color: #777;">No meetings found exceeding 12 minutes.</td></tr>';
+    }
+
+    // 4. Construct Email Body
+    var htmlBody = '<div style="font-family: Arial, sans-serif; color: #333;">' +
+      '<h2>Google Meet Report (' + days + ' Days) - Meetings > 12 mins</h2>' +
+      '<p><strong>Meetings Displayed:</strong> ' + filteredCount + '</p>' +
+      '<table style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: left;">' +
+        '<thead>' +
+          '<tr style="border-bottom: 2px solid #dadce0; color: #5f6368;">' +
+            '<th style="padding: 8px;">Meeting Code</th>' +
+            '<th style="padding: 8px;">Calendar Event ID</th>' +
+            '<th style="padding: 8px;">Organizer</th>' +
+            '<th style="padding: 8px;">Last Activity</th>' +
+            '<th style="padding: 8px;">Total Duration</th>' +
+            '<th style="padding: 8px;">Participant Sessions</th>' +
+            '<th style="padding: 8px;">Avg Packet Loss</th>' +
+            '<th style="padding: 8px;">Avg Jitter</th>' +
+          '</tr>' +
+        '</thead>' +
+        '<tbody>' + rowsHtml + '</tbody>' +
+      '</table>' +
+    '</div>';
+
+    // 5. Send Email
+    var recipient = Session.getActiveUser().getEmail();
+    MailApp.sendEmail({
+      to: recipient,
+      subject: "Google Meet Summary Report (>12 min) - Last " + days + " Days",
+      htmlBody: htmlBody
+    });
+
+    Logger.log("Successfully sent " + days + "-day report to " + recipient);
+
+  } catch (err) {
+    Logger.log("Error generating " + days + "-day report: " + err.toString());
+  }
+}
+
+/**
+ * Helper function to convert seconds to human-readable strings.
+ */
+function formatSecondsToDuration(totalSec) {
+  if (!totalSec || isNaN(totalSec) || !isFinite(totalSec)) {
+    return "0 min";
+  }
+  var hours = Math.floor(totalSec / 3600);
+  var minutes = Math.floor((totalSec % 3600) / 60);
+
+  if (hours > 0) {
+    return hours + " hr " + minutes + " min";
+  }
+  return minutes + " min";
+}
+
+/**
+ * Trigger function for 7-day report
+ */
+function send7DayReport() {
+  sendMeetReportForDays(7);
+}
+
+/**
+ * Trigger function for 30-day report
+ */
+function send30DayReport() {
+  sendMeetReportForDays(30);
+}
