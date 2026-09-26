@@ -1,8 +1,8 @@
 /**
- * Main wrapper function to build and send the report for a target number of days.
- * @param {number} days - Number of past days to query (e.g., 7 or 30).
+ * Generates and emails the 7-Day Google Meet Report using a key-value text block format.
  */
-function sendMeetReportForDays(days) {
+function send7DayReport() {
+  var days = 7;
   var now = new Date();
   var pastDate = new Date(now.getTime() - (days * 24 * 60 * 60 * 1000));
   var startTime = pastDate.toISOString();
@@ -21,71 +21,79 @@ function sendMeetReportForDays(days) {
       return;
     }
 
-    // 2. Aggregate raw event data by unique meeting_code
+    // 2. Aggregate raw event data treating recurring instances independently
     var meetingMap = {};
 
     activities.forEach(function(event) {
       var organizer = event.actor ? event.actor.email : "Unknown";
       var meetingCode = "Unknown";
       var calendarEventId = "N/A";
-      var durationSec = 0;
+      var conferenceId = "N/A";
+      var clientType = "Unknown";
       var packetLoss = 0;
       var jitter = 0;
+      var eventTime = new Date(event.id.time);
 
       if (event.events && event.events.length > 0) {
         var parameters = event.events[0].parameters;
         if (parameters) {
           parameters.forEach(function(param) {
-            if (param.name === 'meeting_code') {
-              meetingCode = String(param.value || "").trim();
-            }
-            if (param.name === 'calendar_event_id') {
-              calendarEventId = String(param.value || "").trim();
-            }
-            if (param.name === 'duration_seconds') {
-              var parsedVal = parseInt(param.intValue, 10);
-              if (!isNaN(parsedVal) && isFinite(parsedVal)) {
-                durationSec = parsedVal;
-              }
-            }
+            if (param.name === 'meeting_code') meetingCode = String(param.value || "").trim();
+            if (param.name === 'calendar_event_id') calendarEventId = String(param.value || "").trim();
+            if (param.name === 'conference_id') conferenceId = String(param.value || "").trim();
+            if (param.name === 'client_type') clientType = String(param.value || "Unknown").toUpperCase();
             if (param.name === 'mean_packet_loss_percentage') {
               var parsedLoss = parseFloat(param.floatValue);
-              if (!isNaN(parsedLoss) && isFinite(parsedLoss)) {
-                packetLoss = parsedLoss;
-              }
+              if (!isNaN(parsedLoss) && isFinite(parsedLoss)) packetLoss = parsedLoss;
             }
             if (param.name === 'mean_jitter_msec') {
               var parsedJitter = parseInt(param.intValue, 10);
-              if (!isNaN(parsedJitter) && isFinite(parsedJitter)) {
-                jitter = parsedJitter;
-              }
+              if (!isNaN(parsedJitter) && isFinite(parsedJitter)) jitter = parsedJitter;
             }
           });
         }
       }
 
       if (meetingCode !== "Unknown" && meetingCode !== "") {
-        if (!meetingMap[meetingCode]) {
-          meetingMap[meetingCode] = {
+        // Unique composite key ensures recurring meetings/instances are tracked independently
+        var mapKey = meetingCode + "_" + (calendarEventId !== "N/A" ? calendarEventId : conferenceId);
+
+        if (!meetingMap[mapKey]) {
+          meetingMap[mapKey] = {
+            meetingCode: meetingCode,
             organizer: organizer,
             calendarEventId: calendarEventId,
-            totalDurationSec: 0,
-            participantCount: 0,
+            conferenceIds: {},
+            clientTypes: {},
+            activitiesList: [],
             sumPacketLoss: 0,
             sumJitter: 0,
             qualityRecords: 0
           };
         }
 
-        var m = meetingMap[meetingCode];
+        var m = meetingMap[mapKey];
 
         if (m.calendarEventId === "N/A" && calendarEventId !== "N/A") {
           m.calendarEventId = calendarEventId;
         }
 
-        m.participantCount += 1;
-        m.totalDurationSec += durationSec;
-        
+        // Track unique conference IDs
+        if (conferenceId !== "N/A") {
+          m.conferenceIds[conferenceId] = true;
+        }
+
+        // Track client types
+        if (clientType !== "UNKNOWN") {
+          m.clientTypes[clientType] = (m.clientTypes[clientType] || 0) + 1;
+        }
+
+        m.activitiesList.push({
+          time: eventTime,
+          packetLoss: packetLoss,
+          jitter: jitter
+        });
+
         if (packetLoss > 0 || jitter > 0) {
           m.sumPacketLoss += packetLoss;
           m.sumJitter += jitter;
@@ -94,33 +102,189 @@ function sendMeetReportForDays(days) {
       }
     });
 
-    // 3. Format, enrich with Calendar metadata, and filter (Duration >= 12 mins)
-    var rowsHtml = "";
-    var meetingCodes = Object.keys(meetingMap);
+    // 3. Format into key-value text blocks (Filtered by Scheduled Duration >= 12 mins)
+    var blocksHtml = "";
+    var meetingKeys = Object.keys(meetingMap);
     var filteredCount = 0;
 
-    meetingCodes.forEach(function(code) {
-      var data = meetingMap[code];
+    meetingKeys.forEach(function(key) {
+      var data = meetingMap[key];
 
-      // FILTER: Only process meetings with a total duration >= 12 minutes (720 seconds)
-      if (data.totalDurationSec >= 720) {
+      // Fetch Event details, scheduled timing, recurrence, and start/end dates
+      var calendarInfo = getCalendarEventDetails(data.calendarEventId, data.organizer);
+
+      // FILTER: Process meetings with a calendar scheduled duration >= 12 minutes (720 seconds)
+      if (calendarInfo.durationSec >= 720) {
         filteredCount++;
 
-        // Fetch Event details, scheduled timing, and recurrence from Calendar
-        var calendarInfo = getCalendarEventDetails(data.calendarEventId, data.organizer);
+        // Calculate participant sessions count based on unique conference IDs
+        var totalConferences = Object.keys(data.conferenceIds).length;
+        var participantSessions = totalConferences > 0 ? totalConferences : data.activitiesList.length;
 
-        var formattedDuration = formatSecondsToDuration(data.totalDurationSec);
+        // Build Client Type summary string
+        var clientSummary = formatClientTypes(data.clientTypes);
+
+        var avgLoss = data.qualityRecords > 0 ? (data.sumPacketLoss / data.qualityRecords).toFixed(1) + "%" : "-";
+        var avgJitter = data.qualityRecords > 0 ? Math.round(data.sumJitter / data.qualityRecords) + " ms" : "-";
+
+        blocksHtml += '<div style="margin-bottom: 25px; line-height: 1.6; font-size: 14px;">' +
+          '<strong>Event Title :</strong> <i>' + calendarInfo.title + '</i><br>' +
+          '<strong>Meeting Code :</strong> ' + data.meetingCode.toUpperCase() + '<br>' +
+          '<strong>Participant Sessions :</strong> ' + participantSessions + '<br>' +
+          '<strong>Client Types :</strong> ' + clientSummary + '<br>' +
+          '<strong>Total Duration :</strong> ' + calendarInfo.formattedDuration + '<br>' +
+          '<div style="border-bottom: 1px dashed #ccc; margin: 8px 0; width: 300px;"></div>' +
+          '<strong>Event Details :</strong> ' + calendarInfo.description + '<br>' +
+          '<strong>Event Date :</strong> ' + calendarInfo.scheduledTime + '<br>' +
+          '<strong>Recurring Meeting :</strong> ' + calendarInfo.repeatDays + '<br>' +
+          '<strong>Avg. Packet Loss :</strong> ' + avgLoss + '<br>' +
+          '<strong>Avg. Jitter :</strong> ' + avgJitter +
+        '</div>' +
+        '<hr style="border: 0; border-top: 1px solid #e0e0e0; margin: 20px 0;">';
+      }
+    });
+
+    if (filteredCount === 0) {
+      blocksHtml = '<p style="color: #777;">No meetings found exceeding 12 minutes in the last 7 days.</p>';
+    }
+
+    // 4. Construct Email Body
+    var htmlBody = '<div style="font-family: Arial, sans-serif; color: #333; max-width: 650px;">' +
+      '<h2>Google Meet Report (Last 7 Days)</h2>' +
+      '<p><strong>Total Meetings (>12 min):</strong> ' + filteredCount + '</p>' +
+      '<hr style="border: 0; border-top: 2px solid #4285f4; margin-bottom: 20px;">' +
+      blocksHtml +
+    '</div>';
+
+    // 5. Send Email
+    var recipient = Session.getActiveUser().getEmail();
+    MailApp.sendEmail({
+      to: recipient,
+      subject: "Google Meet 7-Day Summary Report",
+      htmlBody: htmlBody
+    });
+
+    Logger.log("Successfully sent 7-day formatted report to " + recipient);
+
+  } catch (err) {
+    Logger.log("Error generating 7-day report: " + err.toString());
+  }
+}
+
+/**
+ * Main wrapper function to build and send tabular reports (e.g. 30 days).
+ * @param {number} days - Number of past days to query.
+ */
+function sendMeetReportForDays(days) {
+  var now = new Date();
+  var pastDate = new Date(now.getTime() - (days * 24 * 60 * 60 * 1000));
+  var startTime = pastDate.toISOString();
+
+  try {
+    var response = AdminReports.Activities.list('all', 'meet', {
+      startTime: startTime,
+      maxResults: 1000
+    });
+
+    var activities = response.items;
+
+    if (!activities || activities.length === 0) {
+      Logger.log("No Google Meet activity found in the last " + days + " days.");
+      return;
+    }
+
+    var meetingMap = {};
+
+    activities.forEach(function(event) {
+      var organizer = event.actor ? event.actor.email : "Unknown";
+      var meetingCode = "Unknown";
+      var calendarEventId = "N/A";
+      var conferenceId = "N/A";
+      var clientType = "Unknown";
+      var packetLoss = 0;
+      var jitter = 0;
+
+      if (event.events && event.events.length > 0) {
+        var parameters = event.events[0].parameters;
+        if (parameters) {
+          parameters.forEach(function(param) {
+            if (param.name === 'meeting_code') meetingCode = String(param.value || "").trim();
+            if (param.name === 'calendar_event_id') calendarEventId = String(param.value || "").trim();
+            if (param.name === 'conference_id') conferenceId = String(param.value || "").trim();
+            if (param.name === 'client_type') clientType = String(param.value || "Unknown").toUpperCase();
+            if (param.name === 'mean_packet_loss_percentage') {
+              var parsedLoss = parseFloat(param.floatValue);
+              if (!isNaN(parsedLoss) && isFinite(parsedLoss)) packetLoss = parsedLoss;
+            }
+            if (param.name === 'mean_jitter_msec') {
+              var parsedJitter = parseInt(param.intValue, 10);
+              if (!isNaN(parsedJitter) && isFinite(parsedJitter)) jitter = parsedJitter;
+            }
+          });
+        }
+      }
+
+      if (meetingCode !== "Unknown" && meetingCode !== "") {
+        var mapKey = meetingCode + "_" + (calendarEventId !== "N/A" ? calendarEventId : conferenceId);
+
+        if (!meetingMap[mapKey]) {
+          meetingMap[mapKey] = {
+            meetingCode: meetingCode,
+            organizer: organizer,
+            calendarEventId: calendarEventId,
+            conferenceIds: {},
+            clientTypes: {},
+            activitiesList: [],
+            sumPacketLoss: 0,
+            sumJitter: 0,
+            qualityRecords: 0
+          };
+        }
+
+        var m = meetingMap[mapKey];
+
+        if (m.calendarEventId === "N/A" && calendarEventId !== "N/A") {
+          m.calendarEventId = calendarEventId;
+        }
+
+        if (conferenceId !== "N/A") m.conferenceIds[conferenceId] = true;
+        if (clientType !== "UNKNOWN") m.clientTypes[clientType] = (m.clientTypes[clientType] || 0) + 1;
+
+        if (packetLoss > 0 || jitter > 0) {
+          m.sumPacketLoss += packetLoss;
+          m.sumJitter += jitter;
+          m.qualityRecords += 1;
+        }
+      }
+    });
+
+    var rowsHtml = "";
+    var meetingKeys = Object.keys(meetingMap);
+    var filteredCount = 0;
+
+    meetingKeys.forEach(function(key) {
+      var data = meetingMap[key];
+      var calendarInfo = getCalendarEventDetails(data.calendarEventId, data.organizer);
+
+      if (calendarInfo.durationSec >= 720) {
+        filteredCount++;
+
+        var totalConferences = Object.keys(data.conferenceIds).length;
+        var participantSessions = totalConferences > 0 ? totalConferences : data.activitiesList.length;
+        var clientSummary = formatClientTypes(data.clientTypes);
+
         var avgLoss = data.qualityRecords > 0 ? (data.sumPacketLoss / data.qualityRecords).toFixed(1) + "%" : "-";
         var avgJitter = data.qualityRecords > 0 ? Math.round(data.sumJitter / data.qualityRecords) + " ms" : "-";
 
         rowsHtml += '<tr style="border-bottom: 1px solid #e0e0e0;">' +
-          '<td style="padding: 8px;">' + code + '</td>' +
+          '<td style="padding: 8px;">' + data.meetingCode + '</td>' +
           '<td style="padding: 8px;">' + calendarInfo.title + '</td>' +
           '<td style="padding: 8px;">' + calendarInfo.description + '</td>' +
           '<td style="padding: 8px;">' + calendarInfo.scheduledTime + '</td>' +
           '<td style="padding: 8px;">' + calendarInfo.repeatDays + '</td>' +
-          '<td style="padding: 8px;">' + formattedDuration + '</td>' +
-          '<td style="padding: 8px;">' + data.participantCount + '</td>' +
+          '<td style="padding: 8px;">' + calendarInfo.formattedDuration + '</td>' +
+          '<td style="padding: 8px;">' + participantSessions + '</td>' +
+          '<td style="padding: 8px;">' + clientSummary + '</td>' +
           '<td style="padding: 8px;">' + avgLoss + '</td>' +
           '<td style="padding: 8px;">' + avgJitter + '</td>' +
         '</tr>';
@@ -128,10 +292,9 @@ function sendMeetReportForDays(days) {
     });
 
     if (filteredCount === 0) {
-      rowsHtml = '<tr><td colspan="9" style="padding: 12px; text-align: center; color: #777;">No meetings found exceeding 12 minutes.</td></tr>';
+      rowsHtml = '<tr><td colspan="10" style="padding: 12px; text-align: center; color: #777;">No meetings found exceeding 12 minutes.</td></tr>';
     }
 
-    // 4. Construct Email Body
     var htmlBody = '<div style="font-family: Arial, sans-serif; color: #333;">' +
       '<h2>Google Meet Detailed Report (' + days + ' Days) - Meetings > 12 mins</h2>' +
       '<p><strong>Meetings Displayed:</strong> ' + filteredCount + '</p>' +
@@ -145,6 +308,7 @@ function sendMeetReportForDays(days) {
             '<th style="padding: 8px;">Recurrence</th>' +
             '<th style="padding: 8px;">Total Duration</th>' +
             '<th style="padding: 8px;">Participant Sessions</th>' +
+            '<th style="padding: 8px;">Client Types</th>' +
             '<th style="padding: 8px;">Avg Packet Loss</th>' +
             '<th style="padding: 8px;">Avg Jitter</th>' +
           '</tr>' +
@@ -153,7 +317,6 @@ function sendMeetReportForDays(days) {
       '</table>' +
     '</div>';
 
-    // 5. Send Email
     var recipient = Session.getActiveUser().getEmail();
     MailApp.sendEmail({
       to: recipient,
@@ -169,11 +332,20 @@ function sendMeetReportForDays(days) {
 }
 
 /**
- * Helper function to look up Title, Details, Scheduled Times & Recurrence from Google Calendar
+ * Helper function to format client types object into a string
+ */
+function formatClientTypes(clientTypesObj) {
+  var keys = Object.keys(clientTypesObj);
+  if (keys.length === 0) return "N/A";
+  return keys.map(function(k) { return k + ": " + clientTypesObj[k]; }).join(", ");
+}
+
+/**
+ * Helper function to look up Title, Details, Scheduled Times & Calculate Duration from Calendar
  */
 function getCalendarEventDetails(eventId, organizerEmail) {
   if (!eventId || eventId === "N/A") {
-    return { title: "N/A", description: "N/A", scheduledTime: "N/A", repeatDays: "No" };
+    return { title: "N/A", description: "No details provided", scheduledTime: "N/A", repeatDays: "No", durationSec: 0, formattedDuration: "0 min", startDate: null, endDate: null };
   }
 
   try {
@@ -181,51 +353,44 @@ function getCalendarEventDetails(eventId, organizerEmail) {
     var event = calendar.getEventById(eventId);
 
     if (event) {
-      // 1. Description
       var rawDesc = event.getDescription() || "No details provided";
       var cleanDesc = rawDesc.replace(/<[^>]*>?/gm, '').substring(0, 100);
       if (rawDesc.length > 100) cleanDesc += "...";
 
-      // 2. Scheduled Start and End Date/Time
       var startTime = event.getStartTime();
       var endTime = event.getEndTime();
+      
+      var durationSec = Math.floor((endTime.getTime() - startTime.getTime()) / 1000);
+      var formattedDuration = formatSecondsToDuration(durationSec);
+
       var timeOptions = { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' };
       var formattedTiming = startTime.toLocaleDateString(undefined, timeOptions) + " - " + endTime.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
 
-      // 3. Recurrence / Repeat Days
-      var repeatDays = "No";
-      if (event.isRecurringEvent()) {
-        repeatDays = "Recurring";
-        try {
-          var series = event.getEventSeries();
-          var recurrence = series.getRecurrence();
-          if (recurrence) {
-            repeatDays = "Yes (Series)";
-          }
-        } catch (recErr) {
-          repeatDays = "Yes";
-        }
-      }
+      var repeatDays = event.isRecurringEvent() ? "Yes" : "No";
 
       return {
         title: event.getTitle() || "Untitled Event",
         description: cleanDesc,
         scheduledTime: formattedTiming,
-        repeatDays: repeatDays
+        repeatDays: repeatDays,
+        durationSec: durationSec,
+        formattedDuration: formattedDuration,
+        startDate: startTime,
+        endDate: endTime
       };
     }
   } catch (e) {
     Logger.log("Could not fetch calendar event ID " + eventId + ": " + e.message);
   }
 
-  return { title: "Not Found / Restricted", description: "N/A", scheduledTime: "N/A", repeatDays: "N/A" };
+  return { title: "Not Found / Restricted", description: "No details provided", scheduledTime: "N/A", repeatDays: "No", durationSec: 0, formattedDuration: "0 min", startDate: null, endDate: null };
 }
 
 /**
  * Helper function to convert seconds to human-readable strings.
  */
 function formatSecondsToDuration(totalSec) {
-  if (!totalSec || isNaN(totalSec) || !isFinite(totalSec)) {
+  if (!totalSec || isNaN(totalSec) || !isFinite(totalSec) || totalSec <= 0) {
     return "0 min";
   }
   var hours = Math.floor(totalSec / 3600);
@@ -235,13 +400,6 @@ function formatSecondsToDuration(totalSec) {
     return hours + " hr " + minutes + " min";
   }
   return minutes + " min";
-}
-
-/**
- * Trigger function for 7-day report
- */
-function send7DayReport() {
-  sendMeetReportForDays(7);
 }
 
 /**
